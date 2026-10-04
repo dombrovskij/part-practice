@@ -97,6 +97,7 @@ button:focus-visible,input:focus-visible,label.add:focus-within{outline:3px soli
 .mini{height:38px;border-radius:9px;border:1.5px solid var(--line);background:transparent;padding:0 12px;font-weight:700;font-size:.9rem}
 .mini[aria-pressed="true"]{background:var(--danger);border-color:var(--danger);color:var(--surface)}
 .mini.rm{color:var(--muted);font-weight:400}
+.mini.armed{background:var(--danger);border-color:var(--danger);color:var(--surface);font-weight:700}
 .vrow{display:grid;grid-template-columns:1fr 3.2em;gap:10px;align-items:center;margin-top:6px}
 .vrow input{width:100%;accent-color:var(--accent);height:30px}
 .vrow span{text-align:right;color:var(--muted);font-size:.9rem}
@@ -468,18 +469,30 @@ footer p{margin:0 0 4px}
     if (!isFinite(d) || d <= 0) return;
     try { ms.setPositionState({ duration: d, position: Math.min(Math.max(0, audioEl.currentTime || 0), d), playbackRate: 1 }); } catch(e){}
   }
-  if (ms){
+  // iPhone's lock screen shows previous/next buttons, so those jump 5 s back/forward.
+  function registerHandlers(){
+    if (!ms) return;
     var h = function(name, fn){ try { ms.setActionHandler(name, fn); } catch(e){} };
+    var back = function(){ seek(currentPos() - 5); };
+    var fwd = function(){ seek(currentPos() + 5); };
     h('play', function(){ play(); });
     h('pause', function(){ pause(); });
-    h('seekbackward', function(){ seek(currentPos() - 5); });
-    h('seekforward', function(){ seek(currentPos() + 5); });
-    h('seekto', function(d){ if (mix && d && d.seekTime != null) seek(mix.base + d.seekTime); });
-    h('previoustrack', null);
-    h('nexttrack', null);
+    h('previoustrack', back);
+    h('nexttrack', fwd);
+    h('seekbackward', back);
+    h('seekforward', fwd);
+    h('seekto', function(d){
+      if (!mix || !d || d.seekTime == null) return;
+      if (d.fastSeek && 'fastSeek' in audioEl){ try { audioEl.fastSeek(d.seekTime); updatePositionState(); return; } catch(e){} }
+      seek(mix.base + d.seekTime);
+    });
   }
+  registerHandlers();
   ['play','pause','seeked','loadedmetadata','ratechange'].forEach(function(ev){
-    audioEl.addEventListener(ev, function(){ updatePositionState(); updatePlayIcon(); });
+    audioEl.addEventListener(ev, function(){
+      if (ev === 'play' || ev === 'loadedmetadata') registerHandlers();
+      updatePositionState(); updatePlayIcon();
+    });
   });
   audioEl.addEventListener('ended', function(){
     if (mix && !mix.loop){ try { audioEl.currentTime = 0; } catch(e){} pausedPos = 0; }
@@ -504,6 +517,19 @@ footer p{margin:0 0 4px}
     return dbPutSong(clean).catch(function(){});
   }
   function scheduleSave(){ clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 400); }
+
+  // Tap once to arm, tap again within 4 s to confirm (pop-up confirm boxes are blocked in some views).
+  function confirmTap(btn, label, armedLabel, action){
+    var armed = false, timer = null;
+    btn.addEventListener('click', function(){
+      if (!armed){
+        armed = true; btn.textContent = armedLabel; btn.classList.add('armed');
+        timer = setTimeout(function(){ armed = false; btn.textContent = label; btn.classList.remove('armed'); }, 4000);
+        return;
+      }
+      clearTimeout(timer); action();
+    });
+  }
 
   // ---------- library ----------
   function renderLibrary(){
@@ -536,8 +562,7 @@ footer p{margin:0 0 4px}
         inp.addEventListener('keydown', function(e){ if (e.key === 'Enter') inp.blur(); });
       });
       var del = document.createElement('button'); del.className = 'mini rm'; del.textContent = 'Delete';
-      del.addEventListener('click', function(){
-        if (!confirm('Delete "' + (sg.name || 'Untitled song') + '" and its tracks from this device?')) return;
+      confirmTap(del, 'Delete', 'Tap to confirm', function(){
         (sg.tracks || []).forEach(function(t){ dbDelAudio(t.tid).catch(function(){}); delete audioCache[t.tid]; });
         dbDelSong(sg.id).catch(function(){});
         songs = songs.filter(function(x){ return x !== sg; });
@@ -676,9 +701,8 @@ footer p{margin:0 0 4px}
       el.querySelector('.mute').addEventListener('click', function(e){
         t.muted = !t.muted; e.currentTarget.setAttribute('aria-pressed', String(t.muted)); scheduleSave(); scheduleRemix();
       });
-      el.querySelector('.rm').addEventListener('click', function(){
-        if (confirm('Remove "' + (t.name || 'this track') + '" from this song?')) removeTrack(t.id);
-      });
+      var rmBtn = el.querySelector('.rm');
+      confirmTap(rmBtn, 'Remove', 'Tap to confirm', function(){ removeTrack(t.id); });
       box.appendChild(el);
     });
     (cur && cur.missing || []).forEach(function(m){
