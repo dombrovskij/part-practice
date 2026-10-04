@@ -63,6 +63,9 @@ button:focus-visible,input:focus-visible,label.add:focus-within{outline:3px soli
 .staff .zone{position:absolute;top:8px;bottom:8px;background:var(--hl);border-left:2px solid var(--hl-edge);border-right:2px solid var(--hl-edge);border-radius:3px}
 .staff .zone.off{background:transparent;border-style:dashed;opacity:.7}
 .staff .marker{position:absolute;top:8px;bottom:8px;width:0;border-left:2px dashed var(--hl-edge)}
+.staff .smark{position:absolute;top:0;bottom:0;width:0;border-left:3px solid var(--ink);opacity:.6}
+.staff .smark.off{border-left-style:dashed;opacity:.3}
+
 .staff .head{position:absolute;top:0;bottom:0;width:3px;margin-left:-1.5px;background:var(--accent);border-radius:2px}
 .times{display:flex;justify-content:space-between;color:var(--muted);font-size:.9rem;margin-top:6px}
 .times b{color:var(--ink);font-size:1.05rem}
@@ -137,7 +140,7 @@ footer p{margin:0 0 4px}
     <footer>
       <p>Songs are saved in this browser on this device and never uploaded. Clearing your browser's website data removes them, so keep the originals in Drive.</p>
       <p>To keep playing with your phone locked, open this page in Safari rather than inside another app.</p>
-      <p id="diag">Version 9.</p>
+      <p id="diag">Version 11.</p>
     </footer>
   </div>
 
@@ -157,6 +160,7 @@ footer p{margin:0 0 4px}
           <div class="lines"></div>
           <div class="zone" id="zone" hidden></div>
           <div class="marker" id="markA" hidden></div>
+          <div class="smark" id="markS" hidden></div>
           <div class="head" id="head"></div>
         </div>
         <div class="times num"><b id="tNow">0:00.0</b><span id="tDur">0:00.0</span></div>
@@ -199,12 +203,29 @@ footer p{margin:0 0 4px}
             <button class="ghost" id="loopClear" disabled>Clear</button>
           </div>
         </div>
-        <p class="hint">While it plays, tap "Set here" at the start and end of the bars. Use the step buttons to choose how far −/+ move a point.</p>
+        <p class="hint">While it plays, tap "Set here" at the start and end of the bars.</p>
       </section>
 
       <section>
-        <h2>Tracks</h2>
+        <h2>Volume</h2>
         <div id="mixer"></div>
+      </section>
+
+      <section>
+        <h2>Start of singing</h2>
+        <div class="panel">
+          <div class="lrow">
+            <span class="lbl">Mark</span><span class="val num" id="vM">—</span>
+            <button class="sq" id="mMinus" aria-label="Move mark earlier">−</button>
+            <button class="sq" id="mPlus" aria-label="Move mark later">+</button>
+            <button class="here" id="setM">Set here</button>
+          </div>
+          <div class="lfoot">
+            <button class="toggle" id="markToggle" aria-pressed="false" disabled>Mark off</button>
+            <button class="ghost" id="markClear" disabled>Clear</button>
+          </div>
+        </div>
+        <p class="hint">With the mark on, the song starts there and skipping back stops at the mark. To hear the intro, drag back on the timeline. −/+ use the step size from Loop.</p>
       </section>
     </div>
 
@@ -260,6 +281,8 @@ footer p{margin:0 0 4px}
   var solo = null;
   var pausedPos = 0;         // position when no mix is loaded
   var loopOn = false, loopA = null, loopB = null;
+  var markPos = null, markOn = false;
+  function minPos(){ return (markOn && markPos != null && markPos < duration()) ? markPos : 0; }
   var scrubbing = false, scrubPos = 0;
   var MIN_LOOP = 0.2, NUDGE = 0.1, renaming = false, loadToken = 0;
   var SR = 44100, MASTER = 0.8;
@@ -315,7 +338,7 @@ footer p{margin:0 0 4px}
     var dur = duration();
     var L = loopValid() ? { a: loopA, b: Math.min(loopB, dur) } : null;
     if (L && (offset < L.a || offset >= L.b)) offset = L.a;
-    if (offset >= dur || offset < 0) offset = 0;
+    if (offset >= dur || offset < 0) offset = minPos();
     applyLiveGains();
     var t = ctx.currentTime + 0.03;
     tracks.forEach(function(tr){
@@ -556,6 +579,7 @@ footer p{margin:0 0 4px}
   function play(){
     if (!tracks.length) return;
     var pos = currentPos();
+    if (pos >= duration() - 0.05) pos = minPos();
     // iOS only lets a page start audio from a tap; start something right away so later swaps are allowed.
     if (!unlocked){
       unlocked = true;
@@ -587,9 +611,10 @@ footer p{margin:0 0 4px}
     if (mix && mix.key === mixKey()){ try { AE().currentTime = clampLocal(mix, pos); } catch(e){} }
     updatePlayIcon(); updatePositionState();
   }
-  function seek(p, fromTimeline){
+  function seek(p, fromTimeline, manual){
     var dur = duration();
-    p = Math.max(0, Math.min(p, Math.max(0, dur - 0.05)));
+    var floor = (manual || fromTimeline || currentPos() < minPos() - 0.01) ? 0 : minPos();
+    p = Math.max(floor, Math.min(p, Math.max(0, dur - 0.05)));
     if (fromTimeline && loopValid() && (p < loopA || p >= loopB)){ loopOn = false; renderLoop(); scheduleSave(); }
     else if (loopValid() && (p < loopA || p >= loopB)) p = loopA;
     if (mode === 'live' && livePlaying) startLive(p);
@@ -630,11 +655,12 @@ footer p{margin:0 0 4px}
   }
   // iPhone's lock screen shows previous/next buttons, so those jump 5 s back/forward.
   function registerHandlers(){
-    if (!ms){ var dg0 = document.getElementById('diag'); if (dg0) dg0.textContent = 'Version 9. Lock-screen buttons: not supported in this browser.'; return; }
+    if (!ms){ var dg0 = document.getElementById('diag'); if (dg0) dg0.textContent = 'Version 11. Lock-screen buttons: not supported in this browser.'; return; }
     var ok = 0;
     var h = function(name, fn){ try { ms.setActionHandler(name, fn); ok++; } catch(e){} };
-    var back = function(){ seek(currentPos() - 5); };
-    var fwd = function(){ seek(currentPos() + 5); };
+    // iOS always draws "10" on these buttons, so they skip 10 s to match
+    var back = function(){ seek(currentPos() - 10); };
+    var fwd = function(){ seek(currentPos() + 10); };
     h('play', function(){ play(); });
     h('pause', function(){ pause(); });
     h('previoustrack', back);
@@ -644,10 +670,10 @@ footer p{margin:0 0 4px}
     h('seekto', function(d){
       if (!mix || !d || d.seekTime == null) return;
       if (d.fastSeek && 'fastSeek' in AE()){ try { AE().fastSeek(d.seekTime); updatePositionState(); return; } catch(e){} }
-      seek(mix.base + d.seekTime);
+      seek(mix.base + d.seekTime, false, true);
     });
     var dg = document.getElementById('diag');
-    if (dg) dg.textContent = 'Version 9. Lock-screen buttons connected: ' + ok + ' of 7.';
+    if (dg) dg.textContent = 'Version 11. Lock-screen buttons connected: ' + ok + ' of 7.';
   }
   registerHandlers();
   els.forEach(function(el){
@@ -660,7 +686,7 @@ footer p{margin:0 0 4px}
     });
     el.addEventListener('ended', function(){
       if (el !== AE()) return;
-      if (mix && !mix.loop){ try { el.currentTime = 0; } catch(e){} pausedPos = 0; }
+      if (mix && !mix.loop){ try { el.currentTime = clampLocal(mix, minPos()); } catch(e){} pausedPos = minPos(); }
       updatePlayIcon();
     });
   });
@@ -672,6 +698,7 @@ footer p{margin:0 0 4px}
     cur.tracks = tracks.map(function(t){ return { tid: t.id, name: t.name, volPct: t.volPct, muted: t.muted }; })
       .concat(cur.missing || []);
     cur.loopA = loopA; cur.loopB = loopB; cur.loopOn = loopOn;
+    cur.markPos = markPos; cur.markOn = markOn;
     cur.updated = Date.now();
   }
   function saveNow(){
@@ -756,6 +783,8 @@ footer p{margin:0 0 4px}
     loopA = sg.loopA != null ? sg.loopA : null;
     loopB = sg.loopB != null ? sg.loopB : null;
     loopOn = !!sg.loopOn;
+    markPos = sg.markPos != null ? sg.markPos : null;
+    markOn = !!sg.markOn;
     $('libView').hidden = true; $('songView').hidden = false;
     $('songTitle').value = sg.name || '';
     window.scrollTo(0, 0);
@@ -784,7 +813,7 @@ footer p{margin:0 0 4px}
     setStatus(missing.length ? ("Couldn't find " + missing.map(function(m){ return m.name; }).join(', ') +
       ' on this device. Remove it below the player or add the file again.') : '', missing.length > 0);
     renderAll();
-    if (loopValid()) pausedPos = loopA;
+    pausedPos = loopValid() ? loopA : minPos();
     if (tracks.length) sync(pausedPos, false);   // prepare the mix so Play starts instantly
     if (isNew){ var t = $('songTitle'); t.focus(); t.select(); }
   }
@@ -896,7 +925,7 @@ footer p{margin:0 0 4px}
     $('empty').hidden = has || missingAny;
     $('addText').textContent = has ? 'Add another track' : 'Add mp3s';
     $('tDur').textContent = fmt(duration());
-    renderSwitch(); renderMixer(); renderLoop();
+    renderSwitch(); renderMixer(); renderLoop(); renderMark();
   }
 
   function renderLoop(){
@@ -936,8 +965,8 @@ footer p{margin:0 0 4px}
     if (tracks.length){
       var dur = duration();
       if (mode === 'live' && livePlaying && !liveLoop && livePos() >= dur){
-        stopLive(); pausedPos = 0; els.forEach(function(el){ el.pause(); });
-        if (mix && mix.key === mixKey()){ try { AE().currentTime = 0; } catch(e){} }
+        stopLive(); pausedPos = minPos(); els.forEach(function(el){ el.pause(); });
+        if (mix && mix.key === mixKey()){ try { AE().currentTime = clampLocal(mix, minPos()); } catch(e){} }
         updatePlayIcon();
       }
       var p = scrubbing ? scrubPos : currentPos();
@@ -1016,7 +1045,44 @@ footer p{margin:0 0 4px}
   });
   $('bBack').addEventListener('click', function(){ seek(currentPos() - 5); });
   $('bFwd').addEventListener('click', function(){ seek(currentPos() + 5); });
-  $('bStart').addEventListener('click', function(){ seek(loopValid() ? loopA : 0); });
+  $('bStart').addEventListener('click', function(){ seek(loopValid() ? loopA : minPos()); });
+
+  // ---------- start-of-singing mark ----------
+  function renderMark(){
+    var dur = duration() || 1, has = markPos != null;
+    $('vM').textContent = has ? fmt(markPos) : '—';
+    $('mMinus').disabled = $('mPlus').disabled = !has;
+    var tg = $('markToggle');
+    tg.disabled = !has;
+    tg.setAttribute('aria-pressed', String(markOn && has));
+    tg.textContent = (markOn && has) ? 'Mark on' : 'Mark off';
+    $('markClear').disabled = !has;
+    var m = $('markS');
+    m.hidden = !has;
+    if (has){ m.style.left = (markPos / dur * 100) + '%'; m.classList.toggle('off', !markOn); }
+  }
+  function afterMarkChange(jump){
+    renderMark(); scheduleSave();
+    if (markOn && markPos != null && (jump || (!isPlaying() && currentPos() < markPos))) seek(markPos, false, true);
+  }
+  $('setM').addEventListener('click', function(){
+    markPos = currentPos(); markOn = true; afterMarkChange(false);
+  });
+  $('mMinus').addEventListener('click', function(){
+    if (markPos == null) return;
+    markPos = Math.max(0, markPos - NUDGE); afterMarkChange(true);
+  });
+  $('mPlus').addEventListener('click', function(){
+    if (markPos == null) return;
+    markPos = Math.min(Math.max(0, duration() - 0.5), markPos + NUDGE); afterMarkChange(true);
+  });
+  $('markToggle').addEventListener('click', function(){
+    if (markPos == null) return;
+    markOn = !markOn; afterMarkChange(false);
+  });
+  $('markClear').addEventListener('click', function(){
+    markPos = null; markOn = false; renderMark(); scheduleSave();
+  });
 
   var staff = $('staff');
   function posFromEvent(e){
