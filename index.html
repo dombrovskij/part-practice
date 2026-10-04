@@ -137,7 +137,7 @@ footer p{margin:0 0 4px}
     <footer>
       <p>Songs are saved in this browser on this device and never uploaded. Clearing your browser's website data removes them, so keep the originals in Drive.</p>
       <p>To keep playing with your phone locked, open this page in Safari rather than inside another app.</p>
-      <p id="diag">Version 7.</p>
+      <p id="diag">Version 8.</p>
     </footer>
   </div>
 
@@ -266,11 +266,11 @@ footer p{margin:0 0 4px}
 
   // The actual player: one <audio> element playing a mix rendered in the browser.
   // A normal media element keeps playing when the phone locks and gets lock-screen controls.
-  var audioEl = new Audio();
-  audioEl.preload = 'auto';
-  audioEl.setAttribute('playsinline', '');
-  document.body.appendChild(audioEl);
-  var mix = null;            // {key, url, base, len, loop} currently in audioEl
+  // Two audio elements: the next mix starts silently in the spare one, then they swap in the same instant.
+  var els = [new Audio(), new Audio()], act = 0;
+  els.forEach(function(el){ el.preload = 'auto'; el.setAttribute('playsinline', ''); document.body.appendChild(el); });
+  function AE(){ return els[act]; }
+  var mix = null;            // {key, url, base, len, loop} currently in the active element
   var mixCache = [];         // recent mixes [{key, url, base, len, loop}]
   var syncToken = 0, remixTimer = null, unlocked = false;
 
@@ -296,17 +296,19 @@ footer p{margin:0 0 4px}
     return m + ':' + (s < 10 ? '0' : '') + s.toFixed(1);
   }
   function volToGain(v){ return Math.pow(v / 100, 2); }
-  function isPlaying(){ return !audioEl.paused && !audioEl.ended && !!mix; }
+  function isPlaying(){ return !AE().paused && !AE().ended && !!mix; }
   function currentPos(){
-    if (mix && audioEl.readyState > 0) return mix.base + (audioEl.currentTime || 0);
+    if (mix && AE().readyState > 0) return mix.base + (AE().currentTime || 0);
     return pausedPos;
   }
-  function audible(tr){ return solo != null ? solo === tr.id : !tr.muted; }
+  function audibleFor(tr, so){ return so != null ? so === tr.id : !tr.muted; }
 
   // ---------- rendering the mix ----------
-  function mixKey(){
-    var seg = loopValid() ? (loopA.toFixed(3) + '-' + Math.min(loopB, duration()).toFixed(3)) : 'full';
-    return seg + '|' + tracks.map(function(t){ return t.id + ':' + (audible(t) ? t.volPct : 0); }).join(',');
+  // so: which part (null = all); full: ignore the loop and render the whole song
+  function mixKey(so, full){
+    if (so === undefined) so = solo;
+    var seg = (!full && loopValid()) ? (loopA.toFixed(3) + '-' + Math.min(loopB, duration()).toFixed(3)) : 'full';
+    return seg + '|' + tracks.map(function(t){ return t.id + ':' + (audibleFor(t, so) ? t.volPct : 0); }).join(',');
   }
   function encodeWav(buf){
     var ch = buf.numberOfChannels, n = buf.length;
@@ -328,50 +330,81 @@ footer p{margin:0 0 4px}
     }
     return new Blob([ab], { type: 'audio/wav' });
   }
-  function renderMix(){
-    var key = mixKey();
+  var pending = {};
+  function renderMix(so, full){
+    if (so === undefined) so = solo;
+    var key = mixKey(so, full);
     for (var i = 0; i < mixCache.length; i++) if (mixCache[i].key === key) return Promise.resolve(mixCache[i]);
+    if (pending[key]) return pending[key];
     var dur = duration();
-    var L = loopValid() ? { a: loopA, b: Math.min(loopB, dur) } : null;
+    var L = (!full && loopValid()) ? { a: loopA, b: Math.min(loopB, dur) } : null;
     var s = L ? L.a : 0, e = L ? L.b : dur;
     var frames = Math.max(1, Math.ceil((e - s) * SR));
     var OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
     var off = new OAC(2, frames, SR);
     var master = off.createGain(); master.gain.value = MASTER; master.connect(off.destination);
     tracks.forEach(function(tr){
-      if (!audible(tr) || tr.vol <= 0 || s >= tr.buffer.duration) return;
+      if (!audibleFor(tr, so) || tr.vol <= 0 || s >= tr.buffer.duration) return;
       var src = off.createBufferSource(); src.buffer = tr.buffer;
       var g = off.createGain(); g.gain.value = tr.vol;
       src.connect(g); g.connect(master);
       src.start(0, s, Math.min(e, tr.buffer.duration) - s);
     });
-    return new Promise(function(res, rej){
+    var pr = new Promise(function(res, rej){
       off.oncomplete = function(ev){ res(ev.renderedBuffer); };
       var p = off.startRendering();
       if (p && p.then) p.then(res, rej);
     }).then(function(rendered){
+      delete pending[key];
       var m = { key: key, url: URL.createObjectURL(encodeWav(rendered)), base: s, len: e - s, loop: !!L };
       mixCache.push(m);
-      while (mixCache.length > 4){
-        var idx = mixCache.findIndex(function(x){ return !mix || x.url !== mix.url; });
-        if (idx < 0) break;
-        URL.revokeObjectURL(mixCache[idx].url); mixCache.splice(idx, 1);
-      }
       return m;
+    }, function(err){ delete pending[key]; throw err; });
+    pending[key] = pr;
+    return pr;
+  }
+  function pruneCache(keep){
+    mixCache = mixCache.filter(function(m){
+      var k = keep.indexOf(m.key) >= 0 || (mix && m.url === mix.url);
+      if (!k) URL.revokeObjectURL(m.url);
+      return k;
     });
+  }
+  // Prepare every part (and the loop, if on) in the background so switching is instant.
+  var preToken = 0;
+  async function prerender(){
+    var t = ++preToken;
+    await new Promise(function(r){ setTimeout(r, 300); });
+    if (t !== preToken || !tracks.length) return;
+    var variants = [null].concat(tracks.map(function(x){ return x.id; }));
+    variants.sort(function(a, b){ return a === solo ? -1 : (b === solo ? 1 : 0); });
+    var jobs = [];
+    if (loopValid()) variants.forEach(function(v){ jobs.push([v, false]); });
+    variants.forEach(function(v){ jobs.push([v, true]); });
+    pruneCache(jobs.map(function(j){ return mixKey(j[0], j[1]); }));
+    for (var i = 0; i < jobs.length; i++){
+      if (t !== preToken) return;
+      try { await renderMix(jobs[i][0], jobs[i][1]); } catch(e){}
+      await new Promise(function(r){ setTimeout(r, 30); });
+    }
   }
   function clearMixes(){
     mixCache.forEach(function(m){ URL.revokeObjectURL(m.url); });
     mixCache = []; mix = null;
   }
-  function waitMeta(){
-    if (audioEl.readyState > 0) return Promise.resolve();
+  function waitMeta(el){
+    if (el.readyState > 0) return Promise.resolve();
     return new Promise(function(res, rej){
       var ok = function(){ cleanup(); res(); };
       var bad = function(){ cleanup(); rej(new Error('load')); };
-      var cleanup = function(){ audioEl.removeEventListener('loadedmetadata', ok); audioEl.removeEventListener('error', bad); };
-      audioEl.addEventListener('loadedmetadata', ok); audioEl.addEventListener('error', bad);
+      var cleanup = function(){ el.removeEventListener('loadedmetadata', ok); el.removeEventListener('error', bad); };
+      el.addEventListener('loadedmetadata', ok); el.addEventListener('error', bad);
     });
+  }
+  function clampLocal(m, pos){
+    var l = pos - m.base;
+    if (m.loop && (l < 0 || l >= m.len)) l = 0;
+    return Math.max(0, Math.min(l, Math.max(0, m.len - 0.05)));
   }
 
   // Make the audio element hold the right mix, at the right spot, playing or paused.
@@ -387,31 +420,45 @@ footer p{margin:0 0 4px}
       catch(e){ clearTimeout(slow); setStatus("Couldn't prepare the mix: " + (e && e.message || e), true); return; }
       clearTimeout(slow);
       if (token !== syncToken) return;
-      var pos = target != null ? target : currentPos();
-      var wasLoop = mix && mix.loop;
-      mix = m;
-      audioEl.src = m.url;
-      audioEl.loop = m.loop;
-      try { await waitMeta(); }
-      catch(e){ setStatus("This browser couldn't play the mix.", true); return; }
-      if (token !== syncToken) return;
+      var old = AE(), next = els[1 - act];
+      var oldPlaying = !!mix && !old.paused;
+      next.muted = true;
+      next.src = m.url;
+      next.loop = m.loop;
+      try { await waitMeta(next); }
+      catch(e){ next.muted = false; setStatus("This browser couldn't play the mix.", true); return; }
+      if (token !== syncToken){ next.muted = false; return; }
+      try { next.currentTime = clampLocal(m, target != null ? target : currentPos()); } catch(e){}
+      if (wantPlay){
+        try { await next.play(); }
+        catch(e){ next.muted = false; if (token === syncToken) setStatus('Tap play to start.'); }
+        if (token !== syncToken){ next.pause(); next.muted = false; return; }
+        if (target == null && oldPlaying){
+          var l2 = clampLocal(m, currentPos());
+          if (Math.abs((next.currentTime || 0) - l2) > 0.08){ try { next.currentTime = l2; } catch(e){} }
+        }
+      }
+      old.pause();
+      next.muted = false;
+      act = 1 - act; mix = m;
+      pausedPos = m.base + (next.currentTime || 0);
       if (/^Preparing/.test($('status').textContent)) setStatus('');
-      target = pos;
-    } else if (target == null){
-      target = currentPos();
-    }
-    var local = target - mix.base;
-    if (mix.loop && (local < 0 || local >= mix.len)) local = 0;
-    local = Math.max(0, Math.min(local, Math.max(0, mix.len - 0.05)));
-    try { audioEl.currentTime = local; } catch(e){}
-    pausedPos = mix.base + local;
-    if (wantPlay){
-      try { await audioEl.play(); }
-      catch(e){ if (token === syncToken) setStatus('Tap play to start.', false); }
-    } else if (!audioEl.paused){
-      audioEl.pause();
+    } else {
+      var el = AE();
+      if (target != null){
+        var local = clampLocal(mix, target);
+        try { el.currentTime = local; } catch(e){}
+        pausedPos = mix.base + local;
+      }
+      if (wantPlay){
+        try { await el.play(); }
+        catch(e){ if (token === syncToken) setStatus('Tap play to start.', false); }
+      } else if (!el.paused){
+        el.pause(); pausedPos = currentPos();
+      }
     }
     updateNowPlaying(); updatePositionState(); updatePlayIcon();
+    prerender();
   }
   function scheduleRemix(){
     clearTimeout(remixTimer);
@@ -422,22 +469,27 @@ footer p{margin:0 0 4px}
     if (!tracks.length) return;
     var pos = currentPos();
     // iOS only lets a page start audio from a tap; start something right away so later swaps are allowed.
-    if (!unlocked && (!mix || mix.key !== mixKey())){
+    if (!unlocked){
       unlocked = true;
-      audioEl.src = SILENT; audioEl.loop = false; mix = null;
-      var p = audioEl.play(); if (p && p.catch) p.catch(function(){});
+      var spare = els[1 - act];
+      spare.src = SILENT; spare.loop = false;
+      var p1 = spare.play();
+      if (p1 && p1.then) p1.then(function(){ if (spare.src === SILENT) spare.pause(); }, function(){});
+      if (!mix || mix.key !== mixKey()){
+        var a0 = AE(); a0.src = SILENT; a0.loop = false; mix = null;
+        var p2 = a0.play(); if (p2 && p2.catch) p2.catch(function(){});
+      }
     }
-    unlocked = true;
     sync(pos, true);
   }
-  function pause(){ syncToken++; audioEl.pause(); pausedPos = currentPos(); updatePlayIcon(); }
+  function pause(){ syncToken++; els.forEach(function(el){ el.pause(); }); pausedPos = currentPos(); updatePlayIcon(); }
   function seek(p, fromTimeline){
     var dur = duration();
     p = Math.max(0, Math.min(p, Math.max(0, dur - 0.05)));
     if (fromTimeline && loopValid() && (p < loopA || p >= loopB)){ loopOn = false; renderLoop(); scheduleSave(); }
     else if (loopValid() && (p < loopA || p >= loopB)) p = loopA;
     if (mix && mix.key === mixKey()){
-      try { audioEl.currentTime = Math.max(0, Math.min(p - mix.base, mix.len - 0.05)); } catch(e){}
+      try { AE().currentTime = Math.max(0, Math.min(p - mix.base, mix.len - 0.05)); } catch(e){}
       pausedPos = p; updatePositionState();
     } else {
       pausedPos = p;
@@ -467,13 +519,13 @@ footer p{margin:0 0 4px}
   }
   function updatePositionState(){
     if (!ms || !ms.setPositionState || !mix) return;
-    var d = audioEl.duration;
+    var d = AE().duration;
     if (!isFinite(d) || d <= 0) return;
-    try { ms.setPositionState({ duration: d, position: Math.min(Math.max(0, audioEl.currentTime || 0), d), playbackRate: 1 }); } catch(e){}
+    try { ms.setPositionState({ duration: d, position: Math.min(Math.max(0, AE().currentTime || 0), d), playbackRate: 1 }); } catch(e){}
   }
   // iPhone's lock screen shows previous/next buttons, so those jump 5 s back/forward.
   function registerHandlers(){
-    if (!ms){ var dg0 = document.getElementById('diag'); if (dg0) dg0.textContent = 'Version 7. Lock-screen buttons: not supported in this browser.'; return; }
+    if (!ms){ var dg0 = document.getElementById('diag'); if (dg0) dg0.textContent = 'Version 8. Lock-screen buttons: not supported in this browser.'; return; }
     var ok = 0;
     var h = function(name, fn){ try { ms.setActionHandler(name, fn); ok++; } catch(e){} };
     var back = function(){ seek(currentPos() - 5); };
@@ -486,22 +538,26 @@ footer p{margin:0 0 4px}
     h('seekforward', fwd);
     h('seekto', function(d){
       if (!mix || !d || d.seekTime == null) return;
-      if (d.fastSeek && 'fastSeek' in audioEl){ try { audioEl.fastSeek(d.seekTime); updatePositionState(); return; } catch(e){} }
+      if (d.fastSeek && 'fastSeek' in AE()){ try { AE().fastSeek(d.seekTime); updatePositionState(); return; } catch(e){} }
       seek(mix.base + d.seekTime);
     });
     var dg = document.getElementById('diag');
-    if (dg) dg.textContent = 'Version 7. Lock-screen buttons connected: ' + ok + ' of 7.';
+    if (dg) dg.textContent = 'Version 8. Lock-screen buttons connected: ' + ok + ' of 7.';
   }
   registerHandlers();
-  ['play','pause','seeked','loadedmetadata','ratechange'].forEach(function(ev){
-    audioEl.addEventListener(ev, function(){
-      if (ev === 'play' || ev === 'loadedmetadata') registerHandlers();
-      updatePositionState(); updatePlayIcon();
+  els.forEach(function(el){
+    ['play','pause','seeked','loadedmetadata','ratechange'].forEach(function(ev){
+      el.addEventListener(ev, function(){
+        if (el !== AE()) return;
+        if (ev === 'play' || ev === 'loadedmetadata') registerHandlers();
+        updatePositionState(); updatePlayIcon();
+      });
     });
-  });
-  audioEl.addEventListener('ended', function(){
-    if (mix && !mix.loop){ try { audioEl.currentTime = 0; } catch(e){} pausedPos = 0; }
-    updatePlayIcon();
+    el.addEventListener('ended', function(){
+      if (el !== AE()) return;
+      if (mix && !mix.loop){ try { el.currentTime = 0; } catch(e){} pausedPos = 0; }
+      updatePlayIcon();
+    });
   });
 
   // ---------- saving the current song ----------
@@ -591,7 +647,7 @@ footer p{margin:0 0 4px}
     var token = ++loadToken;
     cur = sg; cur.missing = [];
     tracks = []; solo = null; renaming = false; $('renameBtn').textContent = 'Rename';
-    syncToken++; audioEl.pause(); clearMixes(); pausedPos = 0;
+    syncToken++; preToken++; els.forEach(function(el){ el.pause(); }); clearMixes(); pausedPos = 0;
     loopA = sg.loopA != null ? sg.loopA : null;
     loopB = sg.loopB != null ? sg.loopB : null;
     loopOn = !!sg.loopOn;
@@ -628,10 +684,10 @@ footer p{margin:0 0 4px}
   }
 
   async function closeSong(){
-    loadToken++; syncToken++;
-    audioEl.pause();
+    loadToken++; syncToken++; preToken++;
+    els.forEach(function(el){ el.pause(); });
     await saveNow();
-    audioEl.removeAttribute('src'); try { audioEl.load(); } catch(e){}
+    els.forEach(function(el){ el.removeAttribute('src'); try { el.load(); } catch(e){} });
     clearMixes();
     tracks = []; cur = null; setStatus('');
     if (ms){ try { ms.metadata = null; } catch(e){} }
@@ -869,7 +925,7 @@ footer p{margin:0 0 4px}
     dbDelAudio(id).catch(function(){}); delete audioCache[id];
     if (solo === id) solo = null;
     if (!tracks.length){
-      syncToken++; audioEl.pause(); audioEl.removeAttribute('src'); clearMixes();
+      syncToken++; preToken++; els.forEach(function(el){ el.pause(); el.removeAttribute('src'); }); clearMixes();
       pausedPos = 0; loopA = loopB = null; loopOn = false; updatePlayIcon();
     } else {
       var dur = duration();
