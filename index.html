@@ -137,6 +137,7 @@ footer p{margin:0 0 4px}
     <footer>
       <p>Songs are saved in this browser on this device and never uploaded. Clearing your browser's website data removes them, so keep the originals in Drive.</p>
       <p>To keep playing with your phone locked, open this page in Safari rather than inside another app.</p>
+      <p id="diag">Version 7.</p>
     </footer>
   </div>
 
@@ -278,6 +279,7 @@ footer p{margin:0 0 4px}
       try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch(e){}
       var AC = window.AudioContext || window.webkitAudioContext;
       ctx = new AC();
+      try { ctx.suspend(); } catch(e){}
     }
   }
   function decode(ab){
@@ -471,8 +473,9 @@ footer p{margin:0 0 4px}
   }
   // iPhone's lock screen shows previous/next buttons, so those jump 5 s back/forward.
   function registerHandlers(){
-    if (!ms) return;
-    var h = function(name, fn){ try { ms.setActionHandler(name, fn); } catch(e){} };
+    if (!ms){ var dg0 = document.getElementById('diag'); if (dg0) dg0.textContent = 'Version 7. Lock-screen buttons: not supported in this browser.'; return; }
+    var ok = 0;
+    var h = function(name, fn){ try { ms.setActionHandler(name, fn); ok++; } catch(e){} };
     var back = function(){ seek(currentPos() - 5); };
     var fwd = function(){ seek(currentPos() + 5); };
     h('play', function(){ play(); });
@@ -486,6 +489,8 @@ footer p{margin:0 0 4px}
       if (d.fastSeek && 'fastSeek' in audioEl){ try { audioEl.fastSeek(d.seekTime); updatePositionState(); return; } catch(e){} }
       seek(mix.base + d.seekTime);
     });
+    var dg = document.getElementById('diag');
+    if (dg) dg.textContent = 'Version 7. Lock-screen buttons connected: ' + ok + ' of 7.';
   }
   registerHandlers();
   ['play','pause','seeked','loadedmetadata','ratechange'].forEach(function(ev){
