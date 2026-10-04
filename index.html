@@ -137,7 +137,7 @@ footer p{margin:0 0 4px}
     <footer>
       <p>Songs are saved in this browser on this device and never uploaded. Clearing your browser's website data removes them, so keep the originals in Drive.</p>
       <p>To keep playing with your phone locked, open this page in Safari rather than inside another app.</p>
-      <p id="diag">Version 8.</p>
+      <p id="diag">Version 9.</p>
     </footer>
   </div>
 
@@ -279,8 +279,91 @@ footer p{margin:0 0 4px}
       try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch(e){}
       var AC = window.AudioContext || window.webkitAudioContext;
       ctx = new AC();
-      try { ctx.suspend(); } catch(e){}
+      liveMaster = ctx.createGain(); liveMaster.gain.value = MASTER; liveMaster.connect(ctx.destination);
     }
+  }
+
+  // ---------- live engine (in the app: instant switching) ----------
+  // While the app is on screen, the tracks play live through Web Audio, so switching parts is instant.
+  // The audio element keeps running silently in sync and takes over when the phone locks.
+  var mode = 'live';         // 'live' = Web Audio audible, element muted; 'element' = element audible
+  var liveMaster = null, liveSources = [], livePlaying = false, liveStartAt = 0, liveOffset = 0, liveLoop = null;
+  function ensureGain(tr){
+    if (!tr.gain){ tr.gain = ctx.createGain(); tr.gain.gain.value = 0; tr.gain.connect(liveMaster); }
+  }
+  function applyLiveGains(){
+    if (!ctx) return;
+    tracks.forEach(function(tr){
+      ensureGain(tr);
+      tr.gain.gain.setTargetAtTime(audibleFor(tr, solo) ? tr.vol : 0, ctx.currentTime, 0.008);
+    });
+  }
+  function livePos(){
+    var p = liveOffset + Math.max(0, ctx.currentTime - liveStartAt);
+    if (liveLoop && p >= liveLoop.b) p = liveLoop.a + ((p - liveLoop.a) % (liveLoop.b - liveLoop.a));
+    return p;
+  }
+  function stopLive(){
+    if (livePlaying) pausedPos = livePos();
+    liveSources.forEach(function(s){ try { s.stop(); } catch(e){} try { s.disconnect(); } catch(e){} });
+    liveSources = []; livePlaying = false;
+  }
+  function startLive(offset){
+    ensureCtx();
+    liveSources.forEach(function(s){ try { s.stop(); } catch(e){} try { s.disconnect(); } catch(e){} });
+    liveSources = [];
+    var dur = duration();
+    var L = loopValid() ? { a: loopA, b: Math.min(loopB, dur) } : null;
+    if (L && (offset < L.a || offset >= L.b)) offset = L.a;
+    if (offset >= dur || offset < 0) offset = 0;
+    applyLiveGains();
+    var t = ctx.currentTime + 0.03;
+    tracks.forEach(function(tr){
+      var src = ctx.createBufferSource(); src.buffer = tr.buffer;
+      if (L){ src.loop = true; src.loopStart = Math.min(L.a, tr.buffer.duration); src.loopEnd = Math.min(L.b, tr.buffer.duration); }
+      src.connect(tr.gain);
+      if (offset < tr.buffer.duration) src.start(t, offset);
+      liveSources.push(src);
+    });
+    livePlaying = true; liveStartAt = t; liveOffset = offset; liveLoop = L;
+    pausedPos = offset;
+  }
+  function setElementMute(){ els.forEach(function(el){ el.muted = (mode === 'live'); }); }
+  // hand playback to the audio element (screen locking)
+  function toElement(){
+    if (mode === 'element') return;
+    var wasLive = livePlaying, pos = currentPos();
+    stopLive();
+    mode = 'element';
+    if (mix && mix.key === mixKey()){
+      try { AE().currentTime = clampLocal(mix, pos); } catch(e){}
+      AE().muted = false;
+      if (wasLive && AE().paused){ var pp = AE().play(); if (pp && pp.catch) pp.catch(function(){}); }
+    } else {
+      setElementMute();
+      if (wasLive) sync(pos, true);
+    }
+    updatePlayIcon(); updatePositionState();
+  }
+  // take playback back into the app (screen unlocked or a tap in the app)
+  function tryLive(){
+    if (mode === 'live' || document.hidden) return;
+    ensureCtx();
+    var go = function(){
+      if (mode === 'live' || document.hidden || ctx.state !== 'running') return;
+      var playingNow = !AE().paused && !AE().ended && !!mix;
+      var pos = currentPos();
+      mode = 'live';
+      if (playingNow){
+        startLive(pos);
+        setTimeout(setElementMute, 30);
+      } else {
+        setElementMute(); pausedPos = pos;
+      }
+      updatePlayIcon();
+    };
+    if (ctx.state === 'running') go();
+    else { var pr = ctx.resume(); if (pr && pr.then) pr.then(go, function(){}); }
   }
   function decode(ab){
     return new Promise(function(res, rej){
@@ -296,8 +379,10 @@ footer p{margin:0 0 4px}
     return m + ':' + (s < 10 ? '0' : '') + s.toFixed(1);
   }
   function volToGain(v){ return Math.pow(v / 100, 2); }
-  function isPlaying(){ return !AE().paused && !AE().ended && !!mix; }
+  function elementPlaying(){ return !AE().paused && !AE().ended && !!mix; }
+  function isPlaying(){ return mode === 'live' ? livePlaying : elementPlaying(); }
   function currentPos(){
+    if (mode === 'live') return livePlaying ? livePos() : pausedPos;
     if (mix && AE().readyState > 0) return mix.base + (AE().currentTime || 0);
     return pausedPos;
   }
@@ -414,7 +499,7 @@ footer p{margin:0 0 4px}
     var token = ++syncToken;
     var key = mixKey();
     if (!mix || mix.key !== key){
-      var slow = setTimeout(function(){ if (token === syncToken) setStatus('Preparing the mix…'); }, 250);
+      var slow = setTimeout(function(){ if (token === syncToken && mode !== 'live') setStatus('Preparing the mix…'); }, 250);
       var m;
       try { m = await renderMix(); }
       catch(e){ clearTimeout(slow); setStatus("Couldn't prepare the mix: " + (e && e.message || e), true); return; }
@@ -431,7 +516,7 @@ footer p{margin:0 0 4px}
       try { next.currentTime = clampLocal(m, target != null ? target : currentPos()); } catch(e){}
       if (wantPlay){
         try { await next.play(); }
-        catch(e){ next.muted = false; if (token === syncToken) setStatus('Tap play to start.'); }
+        catch(e){ next.muted = (mode === 'live'); if (token === syncToken && mode !== 'live') setStatus('Tap play to start.'); }
         if (token !== syncToken){ next.pause(); next.muted = false; return; }
         if (target == null && oldPlaying){
           var l2 = clampLocal(m, currentPos());
@@ -439,22 +524,25 @@ footer p{margin:0 0 4px}
         }
       }
       old.pause();
-      next.muted = false;
+      next.muted = (mode === 'live');
       act = 1 - act; mix = m;
-      pausedPos = m.base + (next.currentTime || 0);
+      if (mode !== 'live') pausedPos = m.base + (next.currentTime || 0);
       if (/^Preparing/.test($('status').textContent)) setStatus('');
     } else {
       var el = AE();
       if (target != null){
         var local = clampLocal(mix, target);
         try { el.currentTime = local; } catch(e){}
-        pausedPos = mix.base + local;
+        if (mode !== 'live') pausedPos = mix.base + local;
       }
+      el.muted = (mode === 'live');
       if (wantPlay){
-        try { await el.play(); }
-        catch(e){ if (token === syncToken) setStatus('Tap play to start.', false); }
+        if (el.paused){
+          try { await el.play(); }
+          catch(e){ if (token === syncToken && mode !== 'live') setStatus('Tap play to start.', false); }
+        }
       } else if (!el.paused){
-        el.pause(); pausedPos = currentPos();
+        el.pause(); if (mode !== 'live') pausedPos = currentPos();
       }
     }
     updateNowPlaying(); updatePositionState(); updatePlayIcon();
@@ -480,14 +568,31 @@ footer p{margin:0 0 4px}
         var p2 = a0.play(); if (p2 && p2.catch) p2.catch(function(){});
       }
     }
-    sync(pos, true);
+    ensureCtx();
+    if (document.hidden){
+      mode = 'element'; stopLive(); sync(pos, true);
+    } else {
+      mode = 'live'; setElementMute();
+      var pr = ctx.resume();
+      startLive(pos);
+      updatePlayIcon();
+      sync(pos, true);
+    }
   }
-  function pause(){ syncToken++; els.forEach(function(el){ el.pause(); }); pausedPos = currentPos(); updatePlayIcon(); }
+  function pause(){
+    var pos = currentPos();
+    stopLive(); syncToken++;
+    els.forEach(function(el){ el.pause(); });
+    pausedPos = pos;
+    if (mix && mix.key === mixKey()){ try { AE().currentTime = clampLocal(mix, pos); } catch(e){} }
+    updatePlayIcon(); updatePositionState();
+  }
   function seek(p, fromTimeline){
     var dur = duration();
     p = Math.max(0, Math.min(p, Math.max(0, dur - 0.05)));
     if (fromTimeline && loopValid() && (p < loopA || p >= loopB)){ loopOn = false; renderLoop(); scheduleSave(); }
     else if (loopValid() && (p < loopA || p >= loopB)) p = loopA;
+    if (mode === 'live' && livePlaying) startLive(p);
     if (mix && mix.key === mixKey()){
       try { AE().currentTime = Math.max(0, Math.min(p - mix.base, mix.len - 0.05)); } catch(e){}
       pausedPos = p; updatePositionState();
@@ -525,7 +630,7 @@ footer p{margin:0 0 4px}
   }
   // iPhone's lock screen shows previous/next buttons, so those jump 5 s back/forward.
   function registerHandlers(){
-    if (!ms){ var dg0 = document.getElementById('diag'); if (dg0) dg0.textContent = 'Version 8. Lock-screen buttons: not supported in this browser.'; return; }
+    if (!ms){ var dg0 = document.getElementById('diag'); if (dg0) dg0.textContent = 'Version 9. Lock-screen buttons: not supported in this browser.'; return; }
     var ok = 0;
     var h = function(name, fn){ try { ms.setActionHandler(name, fn); ok++; } catch(e){} };
     var back = function(){ seek(currentPos() - 5); };
@@ -542,7 +647,7 @@ footer p{margin:0 0 4px}
       seek(mix.base + d.seekTime);
     });
     var dg = document.getElementById('diag');
-    if (dg) dg.textContent = 'Version 8. Lock-screen buttons connected: ' + ok + ' of 7.';
+    if (dg) dg.textContent = 'Version 9. Lock-screen buttons connected: ' + ok + ' of 7.';
   }
   registerHandlers();
   els.forEach(function(el){
@@ -647,7 +752,7 @@ footer p{margin:0 0 4px}
     var token = ++loadToken;
     cur = sg; cur.missing = [];
     tracks = []; solo = null; renaming = false; $('renameBtn').textContent = 'Rename';
-    syncToken++; preToken++; els.forEach(function(el){ el.pause(); }); clearMixes(); pausedPos = 0;
+    syncToken++; preToken++; stopLive(); mode = 'live'; els.forEach(function(el){ el.pause(); }); clearMixes(); pausedPos = 0;
     loopA = sg.loopA != null ? sg.loopA : null;
     loopB = sg.loopB != null ? sg.loopB : null;
     loopOn = !!sg.loopOn;
@@ -670,7 +775,8 @@ footer p{margin:0 0 4px}
         }
         if (token !== loadToken) return;
         var vp = m.volPct != null ? m.volPct : 100;
-        tracks.push({ id: m.tid, name: m.name, volPct: vp, vol: volToGain(vp), muted: !!m.muted, buffer: buf });
+        var trk = { id: m.tid, name: m.name, volPct: vp, vol: volToGain(vp), muted: !!m.muted, buffer: buf };
+        ensureGain(trk); tracks.push(trk);
       } catch(e){ missing.push(m); }
     }
     if (token !== loadToken) return;
@@ -685,8 +791,11 @@ footer p{margin:0 0 4px}
 
   async function closeSong(){
     loadToken++; syncToken++; preToken++;
+    stopLive();
     els.forEach(function(el){ el.pause(); });
     await saveNow();
+    tracks.forEach(function(t){ if (t.gain){ try { t.gain.disconnect(); } catch(e){} } });
+    mode = 'live';
     els.forEach(function(el){ el.removeAttribute('src'); try { el.load(); } catch(e){} });
     clearMixes();
     tracks = []; cur = null; setStatus('');
@@ -710,8 +819,9 @@ footer p{margin:0 0 4px}
       b.textContent = label;
       b.setAttribute('aria-pressed', String(solo === id));
       b.addEventListener('click', function(){
+        tryLive();
         if (solo === id) return;
-        solo = id; renderSwitch(); updateNowPlaying();
+        solo = id; applyLiveGains(); renderSwitch(); updateNowPlaying();
         sync(null, isPlaying());
       });
       box.appendChild(b);
@@ -756,11 +866,11 @@ footer p{margin:0 0 4px}
       name.addEventListener('input', function(){ t.name = name.value; renderSwitch(); scheduleSave(); updateNowPlaying(); });
       range.addEventListener('input', function(){
         t.volPct = +range.value; t.vol = volToGain(t.volPct);
-        pct.textContent = t.volPct + '%'; scheduleSave();
+        pct.textContent = t.volPct + '%'; applyLiveGains(); scheduleSave();
       });
       range.addEventListener('change', function(){ scheduleRemix(); });
       el.querySelector('.mute').addEventListener('click', function(e){
-        t.muted = !t.muted; e.currentTarget.setAttribute('aria-pressed', String(t.muted)); scheduleSave(); scheduleRemix();
+        t.muted = !t.muted; e.currentTarget.setAttribute('aria-pressed', String(t.muted)); applyLiveGains(); scheduleSave(); scheduleRemix();
       });
       var rmBtn = el.querySelector('.rm');
       confirmTap(rmBtn, 'Remove', 'Tap to confirm', function(){ removeTrack(t.id); });
@@ -825,6 +935,11 @@ footer p{margin:0 0 4px}
   function tick(){
     if (tracks.length){
       var dur = duration();
+      if (mode === 'live' && livePlaying && !liveLoop && livePos() >= dur){
+        stopLive(); pausedPos = 0; els.forEach(function(el){ el.pause(); });
+        if (mix && mix.key === mixKey()){ try { AE().currentTime = 0; } catch(e){} }
+        updatePlayIcon();
+      }
       var p = scrubbing ? scrubPos : currentPos();
       $('tNow').textContent = fmt(p);
       $('head').style.left = (dur ? Math.min(p / dur, 1) * 100 : 0) + '%';
@@ -834,8 +949,12 @@ footer p{margin:0 0 4px}
 
   // ---------- loop actions ----------
   function afterLoopChange(jumpToA){
-    var wasPlaying = isPlaying();
+    var wasPlaying = isPlaying(), pos = currentPos();
     renderLoop(); scheduleSave(); updateNowPlaying();
+    if (mode === 'live' && livePlaying){
+      if (loopValid()) startLive(jumpToA ? loopA : pos);
+      else if (liveLoop) startLive(pos);
+    }
     if (loopValid()) sync(jumpToA ? loopA : null, wasPlaying);
     else if (mix && mix.loop) sync(null, wasPlaying);
   }
@@ -875,15 +994,18 @@ footer p{margin:0 0 4px}
   });
   $('loopToggle').addEventListener('click', function(){
     if (loopA == null || loopB == null) return;
-    var wasPlaying = isPlaying();
+    var wasPlaying = isPlaying(), pos = currentPos();
     loopOn = !loopOn;
     renderLoop(); scheduleSave(); updateNowPlaying();
+    if (mode === 'live' && livePlaying) startLive(pos);
     sync(null, wasPlaying);
   });
   $('loopClear').addEventListener('click', function(){
-    var wasPlaying = isPlaying(), hadLoop = mix && mix.loop;
+    var wasPlaying = isPlaying(), hadLoop = mix && mix.loop, pos = currentPos();
+    var liveHadLoop = !!liveLoop;
     loopA = loopB = null; loopOn = false;
     renderLoop(); scheduleSave(); updateNowPlaying();
+    if (mode === 'live' && livePlaying && liveHadLoop) startLive(pos);
     if (hadLoop) sync(null, wasPlaying);
   });
 
@@ -921,16 +1043,18 @@ footer p{margin:0 0 4px}
 
   function removeTrack(id){
     var wasPlaying = isPlaying(), p = currentPos();
+    tracks.forEach(function(x){ if (x.id === id && x.gain){ try { x.gain.disconnect(); } catch(e){} } });
     tracks = tracks.filter(function(x){ return x.id !== id; });
     dbDelAudio(id).catch(function(){}); delete audioCache[id];
     if (solo === id) solo = null;
     if (!tracks.length){
       syncToken++; preToken++; els.forEach(function(el){ el.pause(); el.removeAttribute('src'); }); clearMixes();
-      pausedPos = 0; loopA = loopB = null; loopOn = false; updatePlayIcon();
+      stopLive(); pausedPos = 0; loopA = loopB = null; loopOn = false; updatePlayIcon();
     } else {
       var dur = duration();
       if (loopB != null && loopB > dur) loopB = dur;
       if (loopA != null && loopB != null && loopB - loopA < MIN_LOOP){ loopA = loopB = null; loopOn = false; }
+      if (mode === 'live' && livePlaying) startLive(Math.min(p, dur));
       sync(Math.min(p, dur), wasPlaying);
     }
     renderAll(); saveNow();
@@ -952,7 +1076,8 @@ footer p{margin:0 0 4px}
         try { await dbPutAudio(tid, ab); askPersist(); } catch(err){ unsaved.push(f.name); }
         audioCache[tid] = buf;
         if (cur !== song) continue;
-        tracks.push({ id: tid, name: f.name.replace(/\.[^.]+$/, ''), volPct: 100, vol: 1, muted: false, buffer: buf });
+        var nt = { id: tid, name: f.name.replace(/\.[^.]+$/, ''), volPct: 100, vol: 1, muted: false, buffer: buf };
+        ensureGain(nt); tracks.push(nt);
       } catch(err){ failed.push(f.name); }
     }
     if (cur !== song) return;
@@ -961,10 +1086,16 @@ footer p{margin:0 0 4px}
     if (unsaved.length) msg += "Couldn't save " + unsaved.join(', ') + ' on this device, so it only plays until you close the page.';
     setStatus(msg.trim(), !!msg);
     renderAll(); saveNow();
+    if (mode === 'live' && livePlaying) startLive(currentPos());
     if (tracks.length) sync(null, isPlaying());
   });
 
-  document.addEventListener('visibilitychange', function(){ if (document.hidden) saveNow(); });
+  document.addEventListener('visibilitychange', function(){
+    if (document.hidden){ saveNow(); if (mode === 'live' && livePlaying) toElement(); }
+    else tryLive();
+  });
+  // a tap anywhere in the app helps the live engine resume after the phone was locked
+  document.addEventListener('pointerdown', function(){ if (mode === 'element') tryLive(); }, true);
   window.addEventListener('pagehide', function(){ saveNow(); });
 
   // ---------- start ----------
